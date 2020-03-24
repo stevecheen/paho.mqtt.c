@@ -44,6 +44,7 @@ ENDIF()
 
 ## build options
 SET(PAHO_WITH_SSL FALSE CACHE BOOL "Flag that defines whether to build ssl-enabled binaries too. ")
+SET(PAHO_HAVE_POLL FALSE CACHE BOOL "Use poll instand of select. ")
 SET(PAHO_BUILD_STATIC FALSE CACHE BOOL "Build static library")
 SET(PAHO_BUILD_DOCUMENTATION FALSE CACHE BOOL "Create and install the HTML based API documentation (requires Doxygen)")
 SET(PAHO_BUILD_SAMPLES FALSE CACHE BOOL "Build sample programs")

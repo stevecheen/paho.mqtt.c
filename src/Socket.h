@@ -86,6 +86,7 @@
 #define max(A,B) ( (A) > (B) ? (A):(B))
 #endif
 
+#include "Tree.h"
 #include "LinkedList.h"
 
 /*BE
@@ -108,11 +109,29 @@ def SOCKETS
 BE*/
 
 
+#if defined(USE_POLL)
+#include <sys/epoll.h>
+#include <sys/poll.h>
+	#define MAX_EVENTS 25
+	struct socket_info
+	{
+		int connect_pending;
+		int fd;
+		struct epoll_event event;
+	};
+#endif
 /**
  * Structure to hold all socket data for the module
  */
 typedef struct
 {
+#if defined(USE_POLL)
+	int epoll_fds;                     /**< epoll file descriptor */
+	Tree* fds_tree;
+	struct epoll_event events[MAX_EVENTS];
+	int no_ready;
+	int cur_sds;
+#else
 	fd_set rset, /**< socket read set (see select doc) */
 		rset_saved; /**< saved socket read set */
 	int maxfdp1; /**< max descriptor used +1 (again see select doc) */
@@ -121,6 +140,7 @@ typedef struct
 	List* connect_pending; /**< list of sockets for which a connect is pending */
 	List* write_pending; /**< list of sockets for which a write is pending */
 	fd_set pending_wset; /**< socket pending write set for select */
+#endif
 } Sockets;
 
 
