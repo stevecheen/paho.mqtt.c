@@ -152,7 +152,7 @@ void Socket_outInitialize(void)
 	SocketBuffer_initialize();
 #if defined(USE_POLL)
 	s.fds_tree = TreeInitialize(TreeSockCompare);
-	s.epoll_fds = epoll_create(1024);
+	s.epoll_fds = epoll_create(100);
 	s.cur_sds = 0;
 	s.no_ready = 0;
 #else
@@ -176,6 +176,12 @@ void Socket_outTerminate(void)
 {
 	FUNC_ENTRY;
 #if defined(USE_POLL)
+#if defined(WIN32) || defined(WIN64)
+	closesocket(s.epoll_fds);
+#else
+	close(s.epoll_fds);
+#endif
+    s.epoll_fds = -1;
     TreeFree(s.fds_tree);
 #else
 	ListFree(s.connect_pending);
