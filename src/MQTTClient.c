@@ -2172,7 +2172,6 @@ MQTTResponse MQTTClient_publish5(MQTTClient handle, const char* topicName, int p
 
 	if (deliveryToken && qos > 0)
 		*deliveryToken = msg->msgid;
-
 	if (p->topic) free(p->topic);
 	free(p);
 
@@ -2742,13 +2741,15 @@ const char* MQTTClient_strerror(int code)
  */
 static void MQTTProtocol_checkPendingWrites(void)
 {
+    int rc;
 	FUNC_ENTRY;
 	if (state.pending_writes.count > 0)
 	{
 		ListElement* le = state.pending_writes.first;
 		while (le)
 		{
-			if (Socket_noPendingWrites(((pending_write*)(le->content))->socket))
+            rc = Socket_noPendingWrites(((pending_write*)(le->content))->socket);
+			if (rc)
 			{
 				MQTTProtocol_removePublication(((pending_write*)(le->content))->p);
 				state.pending_writes.current = le;

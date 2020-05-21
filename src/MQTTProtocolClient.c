@@ -132,8 +132,9 @@ static int MQTTProtocol_startPublishCommon(Clients* pubclient, Publish* publish,
 
 	FUNC_ENTRY;
 	rc = MQTTPacket_send_publish(publish, 0, qos, retained, &pubclient->net, pubclient->clientID);
-	if (qos == 0 && rc == TCPSOCKET_INTERRUPTED)
-		MQTTProtocol_storeQoS0(pubclient, publish);
+	if (qos == 0 && rc == TCPSOCKET_INTERRUPTED){
+        MQTTProtocol_storeQoS0(pubclient, publish);
+    }
 	FUNC_EXIT_RC(rc);
 	return rc;
 }
@@ -166,6 +167,9 @@ int MQTTProtocol_startPublish(Clients* pubclient, Publish* publish, int qos, int
 		p.MQTTVersion = (*mm)->MQTTVersion;
 	}
 	rc = MQTTProtocol_startPublishCommon(pubclient, &p, qos, retained);
+    if (qos == 0 && rc == TCPSOCKET_INTERRUPTED){
+        publish->topic = NULL;
+    }
 	FUNC_EXIT_RC(rc);
 	return rc;
 }

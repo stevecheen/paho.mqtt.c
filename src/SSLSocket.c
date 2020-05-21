@@ -956,15 +956,21 @@ int SSLSocket_putdatas(SSL* ssl, int socket, char* buf0, size_t buf0len, int cou
 
 		if (sslerror == SSL_ERROR_WANT_WRITE)
 		{
-			int* sockmem = (int*)malloc(sizeof(int));
 			int free = 1;
 
 			Log(TRACE_MIN, -1, "Partial write: incomplete write of %d bytes on SSL socket %d",
 				iovec.iov_len, socket);
 			SocketBuffer_pendingWrite(socket, ssl, 1, &iovec, &free, iovec.iov_len, 0);
+            #if defined(USE_POLL)
+			struct socket_info* si = (struct socket_info*)(TreeFind(s.fds_tree, &socket)->content); /* find socket_info stucture by socket */
+			si->event.events = EPOLLOUT;
+			rc = epoll_ctl(s.epoll_fds, EPOLL_CTL_MOD, socket, &si->event);
+            #else
+            int* sockmem = (int*)malloc(sizeof(int));
 			*sockmem = socket;
 			ListAppend(s.write_pending, sockmem, sizeof(int));
 			FD_SET(socket, &(s.pending_wset));
+            #endif
 			rc = TCPSOCKET_INTERRUPTED;
 		}
 		else

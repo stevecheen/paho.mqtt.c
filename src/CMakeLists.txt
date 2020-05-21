@@ -109,6 +109,10 @@ ENDIF()
 INSTALL(FILES MQTTAsync.h MQTTClient.h MQTTClientPersistence.h MQTTProperties.h MQTTReasonCodes.h MQTTSubscribeOpts.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
+IF (PAHO_HAVE_POLL)
+    ADD_DEFINITIONS(-DUSE_POLL)
+ENDIF()
+
 IF (PAHO_WITH_SSL)
     SET(OPENSSL_SEARCH_PATH "" CACHE PATH "Directory containing OpenSSL libraries and includes")
 

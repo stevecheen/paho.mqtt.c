@@ -42,12 +42,22 @@
 #include <signal.h>
 #include <ctype.h>
 
+#if defined(USE_POLL)
+#include <sys/epoll.h>
+#endif
+
 #include "Heap.h"
 
 int Socket_setnonblocking(int sock);
 int Socket_error(char* aString, int sock);
+#if defined(USE_POLL)
+int Socket_addSocket(int newSd, struct socket_info** ssi);
+int isReady(struct socket_info* info);
+#else
 int Socket_addSocket(int newSd);
 int isReady(int socket, fd_set* read_set, fd_set* write_set);
+#endif
+
 int Socket_writev(int socket, iobuf* iovecs, int count, unsigned long* bytes);
 int Socket_close_only(int socket);
 int Socket_continueWrite(int socket);
@@ -115,6 +125,24 @@ int Socket_error(char* aString, int sock)
 	return errno;
 }
 
+#if defined(USE_POLL)
+int TreeSockCompare(void* a, void* b, int value)
+{
+	int socka = ((struct socket_info*)a)->fd;
+	int sockb = (value) ? ((struct socket_info*)b)->fd : *(int*)b;
+
+	//printf("socka %d sockb %d value %d\n", socka, sockb, value);
+	return (socka > sockb) ? -1 : (socka == sockb) ? 0 : 1;
+}
+#endif
+
+static Socket_writeComplete* writecomplete = NULL;
+
+void Socket_setWriteCompleteCallback(Socket_writeComplete* mywritecomplete)
+{
+	writecomplete = mywritecomplete;
+}
+
 
 /**
  * Initialize the socket module
@@ -133,6 +161,13 @@ void Socket_outInitialize(void)
 #endif
 
 	SocketBuffer_initialize();
+
+#if defined(USE_POLL)
+	s.fds_tree = TreeInitialize(TreeSockCompare);
+	s.epoll_fds = epoll_create(100);
+	s.cur_sds = 0;
+	s.no_ready = 0;
+#else
 	s.clientsds = ListInitialize();
 	s.connect_pending = ListInitialize();
 	s.write_pending = ListInitialize();
@@ -141,6 +176,7 @@ void Socket_outInitialize(void)
 	FD_ZERO(&(s.pending_wset));
 	s.maxfdp1 = 0;
 	memcpy((void*)&(s.rset_saved), (void*)&(s.rset), sizeof(s.rset_saved));
+#endif
 	FUNC_EXIT;
 }
 
@@ -151,9 +187,19 @@ void Socket_outInitialize(void)
 void Socket_outTerminate(void)
 {
 	FUNC_ENTRY;
+#if defined(USE_POLL)
+#if defined(WIN32) || defined(WIN64)
+	closesocket(s.epoll_fds);
+#else
+	close(s.epoll_fds);
+#endif
+    s.epoll_fds = -1;
+    TreeFree(s.fds_tree);
+#else
 	ListFree(s.connect_pending);
 	ListFree(s.write_pending);
 	ListFree(s.clientsds);
+#endif
 	SocketBuffer_terminate();
 #if defined(WIN32) || defined(WIN64)
 	WSACleanup();
@@ -166,11 +212,35 @@ void Socket_outTerminate(void)
  * Add a socket to the list of socket to check with select
  * @param newSd the new socket to add
  */
+#if defined(USE_POLL)
+int Socket_addSocket(int newSd, struct socket_info** ssi)
+#else
 int Socket_addSocket(int newSd)
+#endif
 {
 	int rc = 0;
 
 	FUNC_ENTRY;
+#if defined(USE_POLL)
+	if (TreeFind(s.fds_tree, &newSd) == NULL)
+	{
+		struct socket_info* si = malloc(sizeof(struct socket_info));
+
+		si->fd = newSd;
+		si->connect_pending = 0;
+		si->event.events = EPOLLIN;
+		si->event.data.ptr = *ssi = si;
+		TreeAdd(s.fds_tree, si, sizeof(struct socket_info));
+		if (epoll_ctl(s.epoll_fds, EPOLL_CTL_ADD, newSd, &si->event) != 0)
+			Socket_error("epoll_ctl add", newSd);
+		rc = Socket_setnonblocking(newSd);
+        if(rc == SOCKET_ERROR){
+            Log(LOG_ERROR, -1, "addSocket: setnonblocking");
+        }
+	}
+	else
+		Log(LOG_ERROR, -1, "addSocket: socket %d already in the list", newSd);
+#else
 	if (ListFindItem(s.clientsds, &newSd, intcompare) == NULL) /* make sure we don't add the same socket twice */
 	{
 		if (s.clientsds->count >= FD_SETSIZE)
@@ -192,6 +262,7 @@ int Socket_addSocket(int newSd)
 	}
 	else
 		Log(LOG_ERROR, -1, "addSocket: socket %d already in the list", newSd);
+#endif
 
 	FUNC_EXIT_RC(rc);
 	return rc;
@@ -206,6 +277,22 @@ int Socket_addSocket(int newSd)
  * @param write_set the socket write set (see select doc)
  * @return boolean - is the socket ready to go?
  */
+#if defined(USE_POLL)
+int isReady(struct socket_info* info)
+{
+	int rc = 0;
+	struct pollfd pollfd;
+	
+	/* the fact that we are here means the we are ready for reading */
+	pollfd.fd = info->fd;
+	pollfd.events = POLLOUT;
+	if (poll(&pollfd, 1, 0) &&                   	/* if the socket is writeable, */
+		(info->event.events & POLLOUT) == 0)        /* and it has no pending writes, */
+		rc = 1;                                     /* return true. */
+
+	return rc;
+}
+#else
 int isReady(int socket, fd_set* read_set, fd_set* write_set)
 {
 	int rc = 1;
@@ -218,6 +305,55 @@ int isReady(int socket, fd_set* read_set, fd_set* write_set)
 	FUNC_EXIT_RC(rc);
 	return rc;
 }
+#endif
+
+
+#if defined(USE_POLL)
+void Socket_epollprocess()
+{
+    int rc;
+	FUNC_ENTRY;
+	/* cycle through the list of returned socket structures, processing each */
+	while (s.cur_sds < s.no_ready)
+	{
+		struct socket_info* cur_info = s.events[s.cur_sds].data.ptr;
+			
+		if (cur_info->event.events & EPOLLIN) /* if this socket is readable */
+		{
+			if (isReady(cur_info))
+				break;
+		}
+		else if ((cur_info->event.events & EPOLLOUT)) /* has a pending write or connect */
+		{
+			if (cur_info->connect_pending)
+			{
+				cur_info->connect_pending = 0;
+				cur_info->event.events = EPOLLIN;
+				if (epoll_ctl(s.epoll_fds, EPOLL_CTL_MOD, cur_info->fd, &cur_info->event) != 0)
+					Socket_error("epoll ctl MOD", cur_info->fd);
+				break;
+			}
+			if (Socket_continueWrite(cur_info->fd))
+			{
+				if ((rc = SocketBuffer_writeComplete(cur_info->fd)) == 0)
+					Log(LOG_SEVERE, 35, NULL);
+				else
+				{
+					cur_info->event.events = EPOLLIN;
+					if (epoll_ctl(s.epoll_fds, EPOLL_CTL_MOD, cur_info->fd, &cur_info->event) != 0)
+						Socket_error("epoll ctl MOD", cur_info->fd);
+
+                    if (writecomplete)
+				        (*writecomplete)(cur_info->fd, rc);
+				}
+			}
+		}
+
+		++s.cur_sds;
+	}
+	FUNC_EXIT;
+}
+#endif
 
 
 /**
@@ -230,27 +366,60 @@ int isReady(int socket, fd_set* read_set, fd_set* write_set)
 int Socket_getReadySocket(int more_work, struct timeval *tp, mutex_type mutex)
 {
 	int rc = 0;
+    #if defined(USE_POLL)
+    int timeout = 1000;
+    #else
 	static struct timeval zero = {0L, 0L}; /* 0 seconds */
 	static struct timeval one = {1L, 0L}; /* 1 second */
 	struct timeval timeout = one;
+    #endif
 
 	FUNC_ENTRY;
 	Thread_lock_mutex(mutex);
+    #if !defined(USE_POLL)
 	if (s.clientsds->count == 0)
 		goto exit;
+    #endif
 
+    #if defined(USE_POLL)
+	if (more_work)
+		timeout = 0;
+	else if (tp)
+		timeout = (tp->tv_sec * 1000) + (tp->tv_usec / 1000);
+    #else
 	if (more_work)
 		timeout = zero;
 	else if (tp)
 		timeout = *tp;
+    #endif
 
+    #if defined(USE_POLL)
+    Socket_epollprocess();
+    #else
 	while (s.cur_clientsds != NULL)
 	{
 		if (isReady(*((int*)(s.cur_clientsds->content)), &(s.rset), &wset))
 			break;
 		ListNextElement(s.clientsds, &s.cur_clientsds);
 	}
+    #endif
 
+    #if defined(USE_POLL)
+    if(s.cur_sds >= s.no_ready)
+    {
+		/* check for any readable sockets, or writeable for pending writes */
+		/* the events field has already been modified for pending writes in Socket_putdatas */
+		rc = epoll_wait(s.epoll_fds, s.events, MAX_EVENTS, timeout);
+		if (rc == SOCKET_ERROR)
+		{
+			Socket_error("read epoll_wait", 0);
+			goto exit;
+		}
+        Log(TRACE_MAX, -1, "Return code %d from epoll wait", rc);
+		
+		if (rc == 0)
+			goto exit; /* no work to do */
+    #else
 	if (s.cur_clientsds == NULL)
 	{
 		int rc1;
@@ -286,7 +455,12 @@ int Socket_getReadySocket(int more_work, struct timeval *tp, mutex_type mutex)
 
 		if (rc == 0 && rc1 == 0)
 			goto exit; /* no work to do */
-
+    #endif
+    #if defined(USE_POLL)
+        s.no_ready = rc;
+		s.cur_sds = 0;
+		Socket_epollprocess();
+    #else
 		s.cur_clientsds = s.clientsds->first;
 		while (s.cur_clientsds != NULL)
 		{
@@ -295,8 +469,18 @@ int Socket_getReadySocket(int more_work, struct timeval *tp, mutex_type mutex)
 				break;
 			ListNextElement(s.clientsds, &s.cur_clientsds);
 		}
+    #endif
 	}
 
+#if defined(USE_POLL)
+	if (s.cur_sds >= s.no_ready)
+		rc = 0;
+	else
+	{
+		rc = ((struct socket_info*)(s.events[s.cur_sds].data.ptr))->fd;
+		++s.cur_sds;
+	}
+#else
 	if (s.cur_clientsds == NULL)
 		rc = 0;
 	else
@@ -304,6 +488,7 @@ int Socket_getReadySocket(int more_work, struct timeval *tp, mutex_type mutex)
 		rc = *((int*)(s.cur_clientsds->content));
 		ListNextElement(s.clientsds, &s.cur_clientsds);
 	}
+#endif
 exit:
 	Thread_unlock_mutex(mutex);
 	FUNC_EXIT_RC(rc);
@@ -398,7 +583,21 @@ exit:
 	return buf;
 }
 
-
+#if defined(USE_POLL)
+int Socket_noPendingWrites(int socket)
+{	
+	int rc = 1;
+	struct socket_info* si = NULL;
+	Node* elem = NULL;
+	
+	FUNC_ENTRY;
+	elem = TreeFind(s.fds_tree, &socket);
+	if (elem && ((si = (struct socket_info*)(elem->content)) != NULL))
+		rc = ((si->event.events & POLLOUT) == 0);
+	FUNC_EXIT_RC(rc);
+	return rc;
+}
+#else
 /**
  *  Indicate whether any data is pending outbound for a socket.
  *  @return boolean - true == data pending.
@@ -408,7 +607,7 @@ int Socket_noPendingWrites(int socket)
 	int cursock = socket;
 	return ListFindItem(s.write_pending, &cursock, intcompare) == NULL;
 }
-
+#endif
 
 /**
  *  Attempts to write a series of iovec buffers to a socket in *one* system call so that
@@ -526,7 +725,6 @@ int Socket_putdatas(int socket, char* buf0, size_t buf0len, int count, char** bu
 			rc = TCPSOCKET_COMPLETE;
 		else
 		{
-			int* sockmem = (int*)malloc(sizeof(int));
 			Log(TRACE_MIN, -1, "Partial write: %lu bytes of %lu actually written on socket %d",
 					bytes, total, socket);
 #if defined(OPENSSL)
@@ -534,10 +732,17 @@ int Socket_putdatas(int socket, char* buf0, size_t buf0len, int count, char** bu
 #else
 			SocketBuffer_pendingWrite(socket, count+1, iovecs, frees1, total, bytes);
 #endif
+#if defined(USE_POLL)
+			struct socket_info* si = (struct socket_info*)(TreeFind(s.fds_tree, &socket)->content); /* find socket_info stucture by socket */
+			si->event.events = EPOLLOUT;
+			rc = epoll_ctl(s.epoll_fds, EPOLL_CTL_MOD, socket, &si->event);
+#else
+            int* sockmem = (int*)malloc(sizeof(int));
 			*sockmem = socket;
 			ListAppend(s.write_pending, sockmem, sizeof(int));
 			FD_SET(socket, &(s.pending_wset));
-			rc = TCPSOCKET_INTERRUPTED;
+#endif
+            rc = TCPSOCKET_INTERRUPTED;
 		}
 	}
 exit:
@@ -551,7 +756,50 @@ exit:
 	return rc;
 }
 
+#if defined(USE_POLL)
+void Socket_addPendingWrite(int socket)
+{
+	int rc = 1;
+	struct socket_info* si = NULL;
+	Node* elem = NULL;
+	
+	FUNC_ENTRY;
+	elem = TreeFind(s.fds_tree, &socket);
+	if (elem && ((si = (struct socket_info*)(elem->content)) != NULL)){
+        si->event.events |= EPOLLOUT;
+        rc = epoll_ctl(s.epoll_fds, EPOLL_CTL_MOD,socket,&si->event);
+        if(rc != 0){
+            Socket_error("epoll_ctl mod", socket);
+        }
+    }
+	FUNC_EXIT;
+	return ;
+}
 
+void Socket_clearPendingWrite(int socket)
+{
+	int rc = 1;
+	struct socket_info* si = NULL;
+	Node* elem = NULL;
+	
+	FUNC_ENTRY;
+	elem = TreeFind(s.fds_tree, &socket);
+	if (elem && ((si = (struct socket_info*)(elem->content)) != NULL)){
+        if(si->event.events & EPOLLOUT){
+            si->event.events &= ~EPOLLOUT;
+            if(si->event.events != 0){
+                rc = epoll_ctl(s.epoll_fds, EPOLL_CTL_MOD,socket,&si->event);
+                if(rc != 0){
+                    Socket_error("epoll_ctl mod", socket);
+                }
+            }
+        }
+    }
+	FUNC_EXIT;
+	return ;
+}
+
+#else
 /**
  *  Add a socket to the pending write list, so that it is checked for writing in select.  This is used
  *  in connect processing when the TCP connect is incomplete, as we need to check the socket for both
@@ -573,7 +821,7 @@ void Socket_clearPendingWrite(int socket)
 	if (FD_ISSET(socket, &(s.pending_wset)))
 		FD_CLR(socket, &(s.pending_wset));
 }
-
+#endif
 
 /**
  *  Close a socket without removing it from the select list.
@@ -611,17 +859,35 @@ int Socket_close_only(int socket)
 void Socket_close(int socket)
 {
 	FUNC_ENTRY;
+
+#if defined(USE_POLL)
+	/* have to call epoll_ctl DEL before closing the socket */
+	if (epoll_ctl(s.epoll_fds, EPOLL_CTL_DEL, socket, NULL) != 0)
+		Socket_error("epoll_ctl del", socket);
+#endif
+
 	Socket_close_only(socket);
+    #if defined(USE_POLL)
+    struct socket_info* si;
+	if ((si = TreeRemoveKey(s.fds_tree, &socket)) == NULL)
+        Log(LOG_ERROR, -1, "Failed to remove socket %d", socket);
+	else
+		free(si);
+	if (s.cur_sds < s.no_ready && ((struct socket_info*)s.events[s.cur_sds].data.ptr)->fd == socket)
+		++s.cur_sds;
+    #else
 	FD_CLR(socket, &(s.rset_saved));
 	if (FD_ISSET(socket, &(s.pending_wset)))
 		FD_CLR(socket, &(s.pending_wset));
 	if (s.cur_clientsds != NULL && *(int*)(s.cur_clientsds->content) == socket)
 		s.cur_clientsds = s.cur_clientsds->next;
-	Socket_abortWrite(socket);
-	SocketBuffer_cleanup(socket);
 	ListRemoveItem(s.connect_pending, &socket, intcompare);
 	ListRemoveItem(s.write_pending, &socket, intcompare);
+    #endif
+	Socket_abortWrite(socket);
+	SocketBuffer_cleanup(socket);
 
+    #if !defined(USE_POLL)  
 	if (ListRemoveItem(s.clientsds, &socket, intcompare))
 		Log(TRACE_MIN, -1, "Removed socket %d", socket);
 	else
@@ -637,6 +903,7 @@ void Socket_close(int socket)
 		++(s.maxfdp1);
 		Log(TRACE_MAX, -1, "Reset max fdp1 to %d", s.maxfdp1);
 	}
+    #endif
 	FUNC_EXIT;
 }
 
@@ -746,7 +1013,12 @@ int Socket_new(const char* addr, size_t addr_len, int port, int* sock)
 				}
 #endif
 			Log(TRACE_MIN, -1, "New socket %d for %s, port %d",	*sock, addr, port);
-			if (Socket_addSocket(*sock) == SOCKET_ERROR)
+            #if defined(USE_POLL)
+            struct socket_info* si = NULL;
+			if (Socket_addSocket(*sock, &si) == SOCKET_ERROR)
+            #else
+            if(Socket_addSocket(*sock) == SOCKET_ERROR)
+            #endif
 				rc = Socket_error("addSocket", *sock);
 			else
 			{
@@ -761,9 +1033,16 @@ int Socket_new(const char* addr, size_t addr_len, int port, int* sock)
 					rc = Socket_error("connect", *sock);
 				if (rc == EINPROGRESS || rc == EWOULDBLOCK)
 				{
-					int* pnewSd = (int*)malloc(sizeof(int));
-					*pnewSd = *sock;
-					ListAppend(s.connect_pending, pnewSd, sizeof(int));
+                #if defined(USE_POLL)
+					si->connect_pending = 1;
+					si->event.events = EPOLLOUT;
+					if (epoll_ctl(s.epoll_fds, EPOLL_CTL_MOD, si->fd, &si->event) != 0)
+						Socket_error("epoll ctl MOD", si->fd);
+                #else
+                    int* pnewSd = (int*)malloc(sizeof(int));
+                    *pnewSd = *sock;
+                    ListAppend(s.connect_pending, pnewSd, sizeof(int));
+                #endif
 					Log(TRACE_MIN, 15, "Connect pending");
 				}
 			}
@@ -785,15 +1064,6 @@ int Socket_new(const char* addr, size_t addr_len, int port, int* sock)
 	FUNC_EXIT_RC(rc);
 	return rc;
 }
-
-
-static Socket_writeComplete* writecomplete = NULL;
-
-void Socket_setWriteCompleteCallback(Socket_writeComplete* mywritecomplete)
-{
-	writecomplete = mywritecomplete;
-}
-
 
 
 /**
@@ -848,10 +1118,10 @@ int Socket_continueWrite(int socket)
 			for (i = 0; i < pw->count; i++)
 			{
 				if (pw->frees[i])
-                                {
+                {
 					free(pw->iovecs[i].iov_base);
-                                        pw->iovecs[i].iov_base = NULL;
-                                }
+                    pw->iovecs[i].iov_base = NULL;
+                }
 			}
 			rc = 1; /* signal complete */
 			Log(TRACE_MIN, -1, "ContinueWrite: partial write now complete for socket %d", socket);
@@ -914,7 +1184,7 @@ exit:
 	return rc;
 }
 
-
+#if !defined(USE_POLL)
 /**
  *  Continue any outstanding writes for a socket set
  *  @param pwset the set of sockets
@@ -952,6 +1222,7 @@ int Socket_continueWrites(fd_set* pwset)
 	FUNC_EXIT_RC(rc1);
 	return rc1;
 }
+#endif
 
 
 /**
@@ -1020,3 +1291,4 @@ int main(int argc, char *argv[])
 }
 
 #endif
+
