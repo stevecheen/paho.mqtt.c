@@ -112,7 +112,10 @@ INSTALL(FILES MQTTAsync.h MQTTClient.h MQTTClientPersistence.h MQTTProperties.h 
 IF (PAHO_HAVE_POLL)
     ADD_DEFINITIONS(-DUSE_POLL)
 ENDIF()
+<<<<<<< HEAD
 
+=======
+>>>>>>> 440fe978c154f8aae633f9018f551cd5ededb32e
 IF (PAHO_WITH_SSL)
     SET(OPENSSL_SEARCH_PATH "" CACHE PATH "Directory containing OpenSSL libraries and includes")
 

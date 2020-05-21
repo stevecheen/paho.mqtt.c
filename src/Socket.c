@@ -45,7 +45,6 @@
 #if defined(USE_POLL)
 #include <sys/epoll.h>
 #endif
-
 #include "Heap.h"
 
 int Socket_setnonblocking(int sock);
@@ -57,7 +56,6 @@ int isReady(struct socket_info* info);
 int Socket_addSocket(int newSd);
 int isReady(int socket, fd_set* read_set, fd_set* write_set);
 #endif
-
 int Socket_writev(int socket, iobuf* iovecs, int count, unsigned long* bytes);
 int Socket_close_only(int socket);
 int Socket_continueWrite(int socket);
@@ -130,8 +128,6 @@ int TreeSockCompare(void* a, void* b, int value)
 {
 	int socka = ((struct socket_info*)a)->fd;
 	int sockb = (value) ? ((struct socket_info*)b)->fd : *(int*)b;
-
-	//printf("socka %d sockb %d value %d\n", socka, sockb, value);
 	return (socka > sockb) ? -1 : (socka == sockb) ? 0 : 1;
 }
 #endif
@@ -161,7 +157,6 @@ void Socket_outInitialize(void)
 #endif
 
 	SocketBuffer_initialize();
-
 #if defined(USE_POLL)
 	s.fds_tree = TreeInitialize(TreeSockCompare);
 	s.epoll_fds = epoll_create(100);
@@ -289,7 +284,6 @@ int isReady(struct socket_info* info)
 	if (poll(&pollfd, 1, 0) &&                   	/* if the socket is writeable, */
 		(info->event.events & POLLOUT) == 0)        /* and it has no pending writes, */
 		rc = 1;                                     /* return true. */
-
 	return rc;
 }
 #else
@@ -356,6 +350,45 @@ void Socket_epollprocess()
 #endif
 
 
+#if defined(USE_POLL)
+void Socket_epollprocess()
+{
+	FUNC_ENTRY;
+	while (s.cur_sds < s.no_ready)
+	{
+		struct socket_info* cur_info = s.events[s.cur_sds].data.ptr;
+		if (cur_info->event.events & EPOLLIN) /* if this socket is readable */
+		{
+			if (isReady(cur_info))
+				break;
+		}	
+		else if ((cur_info->event.events & EPOLLOUT)) /* has a pending write or connect */
+		{
+			if (cur_info->connect_pending)
+			{
+				cur_info->connect_pending = 0;
+				cur_info->event.events = EPOLLIN;
+				if (epoll_ctl(s.epoll_fds, EPOLL_CTL_MOD, cur_info->fd, &cur_info->event) != 0)
+					Socket_error("epoll ctl MOD", cur_info->fd);
+				break;
+			}
+			if (Socket_continueWrite(cur_info->fd))
+			{
+				if (!SocketBuffer_writeComplete(cur_info->fd))
+					Log(LOG_SEVERE, 35, NULL);
+				else
+				{
+					cur_info->event.events = EPOLLIN;
+					if (epoll_ctl(s.epoll_fds, EPOLL_CTL_MOD, cur_info->fd, &cur_info->event) != 0)
+						Socket_error("epoll ctl MOD", cur_info->fd);
+				}
+			}
+		}
+		++s.cur_sds;
+	}
+	FUNC_EXIT;
+}
+#endif
 /**
  *  Returns the next socket ready for communications as indicated by select
  *  @param more_work flag to indicate more work is waiting, and thus a timeout value of 0 should

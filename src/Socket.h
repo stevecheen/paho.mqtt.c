@@ -120,7 +120,10 @@ BE*/
 		struct epoll_event event;
 	};
 #endif
+<<<<<<< HEAD
 
+=======
+>>>>>>> 440fe978c154f8aae633f9018f551cd5ededb32e
 /**
  * Structure to hold all socket data for the module
  */
